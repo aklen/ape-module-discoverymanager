@@ -86,13 +86,7 @@ public sealed class MdnsDiscoveryTransport : IDiscoveryTransport
             try
             {
                 var urls = await ResolveAllProtocolsAsync(cancellationToken).ConfigureAwait(false);
-                foreach (var url in urls)
-                {
-                    if (!_seenLocations.Add(url))
-                        continue;
-                    _logger.LogInfo($"mDNS: discovered {url}");
-                    DevicesDiscovered?.Invoke(new[] { url });
-                }
+                PublishPollResult(urls);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -111,6 +105,43 @@ public sealed class MdnsDiscoveryTransport : IDiscoveryTransport
             {
                 break;
             }
+        }
+    }
+
+    /// <summary>
+    /// New locations raise <see cref="DevicesDiscovered"/>. Locations missing from this result raise <see cref="DeviceLost"/>.
+    /// Call only after a successful browse so a failed poll does not drop the previous set.
+    /// </summary>
+    private void PublishPollResult(IEnumerable<string> urls)
+    {
+        var current = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var url in urls)
+        {
+            if (!current.Add(url))
+                continue;
+            if (!_seenLocations.Add(url))
+                continue;
+            _logger.LogInfo($"mDNS: discovered {url}");
+            DevicesDiscovered?.Invoke(new[] { url });
+        }
+
+        List<string>? lost = null;
+        foreach (var seen in _seenLocations)
+        {
+            if (current.Contains(seen))
+                continue;
+            lost ??= [];
+            lost.Add(seen);
+        }
+
+        if (lost == null)
+            return;
+
+        foreach (var url in lost)
+        {
+            _seenLocations.Remove(url);
+            _logger.LogInfo($"mDNS: lost {url}");
+            DeviceLost?.Invoke(url);
         }
     }
 
