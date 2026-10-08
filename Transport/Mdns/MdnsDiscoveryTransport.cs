@@ -1,5 +1,6 @@
 using Ape.Core.Logging;
 using Ape.Core.Network.Discovery;
+using Ape.Module.DiscoveryManager.Graph;
 using Zeroconf;
 
 namespace Ape.Module.DiscoveryManager.Transport.Mdns;
@@ -11,6 +12,7 @@ namespace Ape.Module.DiscoveryManager.Transport.Mdns;
 public sealed class MdnsDiscoveryTransport : IDiscoveryTransport
 {
     private readonly ILogger _logger;
+    private readonly IDiscoverySampleSink _sink;
     private readonly IReadOnlyList<string> _browseProtocols;
     private readonly TimeSpan _scanTime;
     private readonly TimeSpan _pollInterval;
@@ -19,10 +21,10 @@ public sealed class MdnsDiscoveryTransport : IDiscoveryTransport
 
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
-    private readonly HashSet<string> _seenLocations = new(StringComparer.Ordinal);
 
     public MdnsDiscoveryTransport(
         ILogger logger,
+        IDiscoverySampleSink sink,
         IReadOnlyList<string> browseProtocols,
         TimeSpan scanTime,
         TimeSpan pollInterval,
@@ -30,6 +32,7 @@ public sealed class MdnsDiscoveryTransport : IDiscoveryTransport
         MdnsDiscoveryFilter? filter = null)
     {
         _logger = logger;
+        _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _browseProtocols = browseProtocols ?? throw new ArgumentNullException(nameof(browseProtocols));
         _scanTime = scanTime;
         _pollInterval = pollInterval;
@@ -41,8 +44,10 @@ public sealed class MdnsDiscoveryTransport : IDiscoveryTransport
 
     public string TransportType => "mdns";
 
+#pragma warning disable CS0067 // The discovery plan raises these. This adapter only enqueues samples.
     public event Action<IEnumerable<string>>? DevicesDiscovered;
     public event Action<string>? DeviceLost;
+#pragma warning restore CS0067
 
     public void Start()
     {
@@ -109,46 +114,24 @@ public sealed class MdnsDiscoveryTransport : IDiscoveryTransport
     }
 
     /// <summary>
-    /// New locations raise <see cref="DevicesDiscovered"/>. Locations missing from this result raise <see cref="DeviceLost"/>.
+    /// Hands the browse result to the discovery plan.
     /// Call only after a successful browse so a failed poll does not drop the previous set.
     /// </summary>
     private void PublishPollResult(IEnumerable<string> urls)
     {
-        var current = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var url in urls)
+        var list = urls as IReadOnlyList<string> ?? urls.Distinct(StringComparer.Ordinal).ToArray();
+        _sink.Submit(new DiscoverySample
         {
-            if (!current.Add(url))
-                continue;
-            if (!_seenLocations.Add(url))
-                continue;
-            _logger.LogInfo($"mDNS: discovered {url}");
-            DevicesDiscovered?.Invoke(new[] { url });
-        }
-
-        List<string>? lost = null;
-        foreach (var seen in _seenLocations)
-        {
-            if (current.Contains(seen))
-                continue;
-            lost ??= [];
-            lost.Add(seen);
-        }
-
-        if (lost == null)
-            return;
-
-        foreach (var url in lost)
-        {
-            _seenLocations.Remove(url);
-            _logger.LogInfo($"mDNS: lost {url}");
-            DeviceLost?.Invoke(url);
-        }
+            Source = DiscoverySources.Mdns,
+            Kind = DiscoverySampleKind.Snapshot,
+            Locations = list,
+        });
     }
 
     public async Task<IEnumerable<string>> DiscoverDevicesAsync()
     {
         var list = await ResolveAllProtocolsAsync(CancellationToken.None).ConfigureAwait(false);
-        DevicesDiscovered?.Invoke(list);
+        PublishPollResult(list);
         return list;
     }
 

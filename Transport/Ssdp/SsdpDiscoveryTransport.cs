@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using Ape.Core.Logging;
 using Ape.Core.Network.Discovery;
+using Ape.Module.DiscoveryManager.Graph;
 
 namespace Ape.Module.DiscoveryManager.Transport.Ssdp;
 
@@ -18,11 +19,11 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
     private static readonly IPEndPoint MulticastEndpoint = new(IPAddress.Parse(MulticastAddress), MulticastPort);
 
     private readonly ILogger _logger;
+    private readonly IDiscoverySampleSink _sink;
     private readonly string? _localDeviceUuid;
     private readonly string? _localIpAddress;
     private readonly SsdpDiscoveryMsearchResponderOptions? _msearchResponder;
     private readonly SsdpDiscoveryOptions _options;
-    private readonly HashSet<string> _discoveredDevices = new(StringComparer.Ordinal);
     private readonly byte[] _msearchPayload = SsdpDatagramParser.BuildMSearchRootDevice();
 
     private Socket? _socket;
@@ -31,22 +32,28 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
     private Task? _msearchTask;
-    private readonly object _searchSessionLock = new();
-    private List<string>? _activeSearchBuffer;
 
     public string TransportType => "ssdp";
 
+#pragma warning disable CS0067 // The discovery plan raises these. This adapter only enqueues samples.
     public event Action<IEnumerable<string>>? DevicesDiscovered;
     public event Action<string>? DeviceLost;
+#pragma warning restore CS0067
+
+    internal bool RewriteVpnLocationHost => _options.RewriteLocationHostFromVpnResponse;
+
+    internal IReadOnlyList<SsdpIpv4Subnet> VpnRewriteSubnets => _vpnRewriteSubnets;
 
     public SsdpDiscoveryTransport(
         ILogger logger,
+        IDiscoverySampleSink sink,
         string? localDeviceUuid = null,
         string? localIpAddress = null,
         SsdpDiscoveryMsearchResponderOptions? msearchResponder = null,
         SsdpDiscoveryOptions? options = null)
     {
         _logger = logger;
+        _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _localDeviceUuid = localDeviceUuid;
         _localIpAddress = localIpAddress;
         _msearchResponder = msearchResponder;
@@ -190,40 +197,18 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
     public async Task<IEnumerable<string>> DiscoverDevicesAsync()
     {
         _logger.LogInfo("SSDP Discovery: Active search (M-SEARCH)…");
-        List<string> buffer;
-        lock (_searchSessionLock)
+        if (_socket != null && _socket.IsBound)
         {
-            buffer = new List<string>();
-            _activeSearchBuffer = buffer;
+            SendMsearchAllInterfaces(_socket, _joinedInterfaces);
+            SendVpnUnicastMsearch(_socket);
         }
+        else
+            _logger.LogWarning("SSDP Discovery: socket not bound; active search skipped");
 
-        try
-        {
-            if (_socket != null && _socket.IsBound)
-            {
-                SendMsearchAllInterfaces(_socket, _joinedInterfaces);
-                SendVpnUnicastMsearch(_socket);
-            }
-            else
-                _logger.LogWarning("SSDP Discovery: socket not bound; active search skipped");
+        await Task.Delay(3500).ConfigureAwait(false);
 
-            await Task.Delay(3500).ConfigureAwait(false);
-        }
-        finally
-        {
-            lock (_searchSessionLock)
-            {
-                _activeSearchBuffer = null;
-            }
-        }
-
-        var distinct = buffer.Distinct(StringComparer.Ordinal).ToList();
-        _logger.LogInfo($"SSDP Discovery: Active search collected {distinct.Count} LOCATION(s).");
-        foreach (var loc in distinct)
-            _logger.LogInfo($"SSDP Discovery: Device found at {loc}");
-
-        // Events are raised from HandleDeviceAvailable as packets arrive; return value is for API callers.
-        return distinct;
+        // Accepted devices are published by the discovery plan on the host frame, not from this wait.
+        return [];
     }
 
     public void Advertise(string deviceDescription)
@@ -499,10 +484,21 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
         if (!SsdpDatagramParser.TryParseHeaders(data, out var headers, out var firstLine))
             return;
 
+        var remote = remoteEndPoint is IPEndPoint ipRemote ? ipRemote.Address.ToString() : null;
+
         if (SsdpDatagramParser.IsNotifyByeBye(firstLine, headers))
         {
             if (SsdpDatagramParser.TryGetLocation(headers, out var byeLoc))
-                HandleDeviceByeBye(byeLoc);
+            {
+                _sink.Submit(new DiscoverySample
+                {
+                    Source = DiscoverySources.Ssdp,
+                    Kind = DiscoverySampleKind.ByeBye,
+                    Location = byeLoc,
+                    RemoteAddress = remote,
+                });
+            }
+
             return;
         }
 
@@ -512,74 +508,16 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
         if (!SsdpDatagramParser.TryGetLocation(headers, out var location))
             return;
 
-        if (remoteEndPoint is IPEndPoint ipRemote)
-        {
-            var rewritten = SsdpLocationHelper.RewriteHostFromResponseSource(
-                location,
-                ipRemote.Address,
-                _vpnRewriteSubnets,
-                _options.RewriteLocationHostFromVpnResponse);
-            if (!string.Equals(rewritten, location, StringComparison.Ordinal))
-            {
-                _logger.LogDebug(
-                    $"SSDP Discovery: Rewrote VPN LOCATION host {location} -> {rewritten} (response from {ipRemote.Address})");
-                location = rewritten;
-            }
-        }
-
         if (!headers.TryGetValue("usn", out var usn))
             usn = string.Empty;
 
-        HandleDeviceAvailable(location, usn);
-    }
-
-    private void HandleDeviceByeBye(string deviceLocation)
-    {
-        if (string.IsNullOrEmpty(deviceLocation))
-            return;
-        if (!_discoveredDevices.Remove(deviceLocation))
-            return;
-        _logger.LogWarning($"SSDP Discovery: Device unavailable at {deviceLocation}");
-        DeviceLost?.Invoke(deviceLocation);
-    }
-
-    private void HandleDeviceAvailable(string deviceLocation, string deviceUsn)
-    {
-        if (string.IsNullOrEmpty(deviceLocation))
-            return;
-
-        if (!string.IsNullOrEmpty(_localDeviceUuid) && deviceUsn.Contains(_localDeviceUuid, StringComparison.Ordinal))
+        _sink.Submit(new DiscoverySample
         {
-            _logger.LogDebug("SSDP Discovery: Ignoring self-discovery (UUID match)");
-            return;
-        }
-
-        if (!string.IsNullOrEmpty(_localIpAddress) && deviceLocation.Contains(_localIpAddress, StringComparison.Ordinal))
-        {
-            _logger.LogDebug($"SSDP Discovery: Ignoring self-discovery (IP match: {_localIpAddress})");
-            return;
-        }
-
-        if (deviceLocation.Contains("127.0.0.1", StringComparison.Ordinal) ||
-            deviceLocation.Contains("localhost", StringComparison.OrdinalIgnoreCase))
-        {
-            _logger.LogDebug("SSDP Discovery: Ignoring localhost device");
-            return;
-        }
-
-        lock (_searchSessionLock)
-        {
-            _activeSearchBuffer?.Add(deviceLocation);
-        }
-
-        if (_discoveredDevices.Contains(deviceLocation))
-        {
-            _logger.LogDebug($"SSDP Discovery: Device already discovered, skipping: {deviceLocation}");
-            return;
-        }
-
-        _discoveredDevices.Add(deviceLocation);
-        _logger.LogInfo($"SSDP Discovery: ✅ New remote device discovered at {deviceLocation}");
-        DevicesDiscovered?.Invoke(new[] { deviceLocation });
+            Source = DiscoverySources.Ssdp,
+            Kind = DiscoverySampleKind.Alive,
+            Location = location,
+            Usn = usn,
+            RemoteAddress = remote,
+        });
     }
 }

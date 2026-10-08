@@ -18,6 +18,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="MessagePack" Version="3.1.11" />
     <PackageReference Include="Rssdp" Version="4.0.4" />
     <PackageReference Include="Zeroconf" Version="3.7.16" />
   </ItemGroup>
