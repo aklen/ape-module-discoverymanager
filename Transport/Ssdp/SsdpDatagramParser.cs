@@ -64,6 +64,20 @@ internal static class SsdpDatagramParser
         return false;
     }
 
+    /// <summary>
+    /// True when this host should unicast-reply. Own searches use <c>upnp:rootdevice</c>;
+    /// <c>ssdp:all</c> and the Ape device URN are answered as well.
+    /// </summary>
+    public static bool IsAnswerableMSearch(string message)
+    {
+        if (!message.StartsWith("M-SEARCH", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return message.Contains("ST: ssdp:all", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("ST: upnp:rootdevice", StringComparison.OrdinalIgnoreCase)
+               || message.Contains($"ST: {SsdpApeDevice.Urn}", StringComparison.OrdinalIgnoreCase);
+    }
+
     public static bool IsNotifyByeBye(string firstLine, IReadOnlyDictionary<string, string> headers)
     {
         if (!firstLine.StartsWith("NOTIFY", StringComparison.OrdinalIgnoreCase))

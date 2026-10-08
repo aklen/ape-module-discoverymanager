@@ -32,6 +32,38 @@ internal static class SsdpInterfaceHelper
         return set.Count > 0 ? set.ToList() : Array.Empty<IPAddress>();
     }
 
+    /// <summary>
+    /// Up, non-loopback IPv4 addresses with the subnet implied by their prefix.
+    /// Prefix 0 is skipped because the subnet cannot be known.
+    /// </summary>
+    public static IReadOnlyList<SsdpLocalIpv4Binding> GetLocalIpv4Bindings()
+    {
+        var bindings = new List<SsdpLocalIpv4Binding>();
+        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (ni.OperationalStatus != OperationalStatus.Up)
+                continue;
+            if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                continue;
+
+            foreach (var addr in ni.GetIPProperties().UnicastAddresses)
+            {
+                if (addr.Address.AddressFamily != AddressFamily.InterNetwork)
+                    continue;
+                if (IPAddress.IsLoopback(addr.Address))
+                    continue;
+                if (addr.PrefixLength is <= 0 or > 32)
+                    continue;
+
+                bindings.Add(new SsdpLocalIpv4Binding(
+                    addr.Address,
+                    SsdpSubnetHelper.FromAddressAndPrefix(addr.Address, addr.PrefixLength)));
+            }
+        }
+
+        return bindings;
+    }
+
     public static IReadOnlyList<SsdpIpv4Subnet> GetLocalVpnSubnets()
     {
         var subnets = new List<SsdpIpv4Subnet>();

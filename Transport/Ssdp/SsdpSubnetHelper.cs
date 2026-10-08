@@ -5,6 +5,8 @@ namespace Ape.Module.DiscoveryManager.Transport.Ssdp;
 
 internal readonly record struct SsdpIpv4Subnet(uint Network, int PrefixLength);
 
+internal readonly record struct SsdpLocalIpv4Binding(IPAddress Address, SsdpIpv4Subnet Subnet);
+
 internal static class SsdpSubnetHelper
 {
     public static bool TryParseCidr(string cidr, out SsdpIpv4Subnet subnet)

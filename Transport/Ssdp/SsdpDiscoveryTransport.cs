@@ -355,7 +355,9 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
 
     private void RefreshVpnRewriteSubnets()
     {
-        var subnets = new List<SsdpIpv4Subnet>(SsdpInterfaceHelper.GetLocalVpnSubnets());
+        var subnets = SsdpInterfaceHelper.GetLocalIpv4Bindings()
+            .Select(binding => binding.Subnet)
+            .ToList();
         foreach (var cidr in _options.ProbeSubnets)
         {
             if (SsdpSubnetHelper.TryParseCidr(cidr, out var subnet))
@@ -426,12 +428,14 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
             return true;
         }
 
-        if (!message.StartsWith("M-SEARCH", StringComparison.OrdinalIgnoreCase))
+        if (!SsdpDatagramParser.IsAnswerableMSearch(message))
             return true;
 
-        if (!message.Contains("ST: ssdp:all", StringComparison.OrdinalIgnoreCase) &&
-            !message.Contains($"ST: {SsdpApeDevice.Urn}", StringComparison.OrdinalIgnoreCase))
-            return true;
+        var remoteAddress = remoteEndPoint is IPEndPoint ipEndPoint ? ipEndPoint.Address : null;
+        var location = SsdpLocationHelper.LocationFacingRemote(
+            _msearchResponder.DeviceLocation,
+            remoteAddress,
+            SsdpInterfaceHelper.GetLocalIpv4Bindings());
 
         try
         {
@@ -443,13 +447,13 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
                 + _msearchResponder.DeviceUsnField
                 + "\r\n"
                 + "LOCATION: "
-                + _msearchResponder.DeviceLocation
+                + location
                 + "\r\n"
                 + $"SERVER: {SsdpApeDevice.ServerHeader}\r\n"
                 + "\r\n";
             var responseBytes = Encoding.UTF8.GetBytes(response);
             socket.SendTo(responseBytes, remoteEndPoint);
-            _logger.LogDebug($"SSDP Discovery: responded to M-SEARCH from {remoteEndPoint}");
+            _logger.LogDebug($"SSDP Discovery: responded to M-SEARCH from {remoteEndPoint} with LOCATION {location}");
         }
         catch (Exception ex)
         {

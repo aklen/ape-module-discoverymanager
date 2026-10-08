@@ -55,6 +55,71 @@ public class SsdpParsingTests
 
         Assert.Contains("M-SEARCH * HTTP/1.1", text, StringComparison.Ordinal);
         Assert.Contains("ST: upnp:rootdevice", text, StringComparison.Ordinal);
+        Assert.True(SsdpDatagramParser.IsAnswerableMSearch(text));
+    }
+
+    [Theory]
+    [InlineData("M-SEARCH * HTTP/1.1\r\nST: ssdp:all\r\n")]
+    [InlineData("M-SEARCH * HTTP/1.1\r\nST: urn:ape:device:core:1\r\n")]
+    public void Answerable_msearch_accepts_all_and_ape_urn(string message)
+    {
+        Assert.True(SsdpDatagramParser.IsAnswerableMSearch(message));
+    }
+
+    [Fact]
+    public void Answerable_msearch_rejects_unrelated_target()
+    {
+        Assert.False(SsdpDatagramParser.IsAnswerableMSearch(
+            "M-SEARCH * HTTP/1.1\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"));
+        Assert.False(SsdpDatagramParser.IsAnswerableMSearch("NOTIFY * HTTP/1.1\r\nNTS: ssdp:alive\r\n"));
+    }
+
+    [Fact]
+    public void Reply_location_uses_the_shared_subnet_address()
+    {
+        var bindings = new[]
+        {
+            Binding("192.168.0.54", "192.168.0.0/24"),
+            Binding("10.11.12.73", "10.11.12.0/24"),
+            Binding("10.8.0.6", "10.8.0.0/24"),
+        };
+
+        var location = SsdpLocationHelper.LocationFacingRemote(
+            "http://192.168.0.54:5000/api/discovery/device.xml",
+            IPAddress.Parse("10.11.12.17"),
+            bindings);
+
+        Assert.Equal("http://10.11.12.73:5000/api/discovery/device.xml", location);
+    }
+
+    [Fact]
+    public void Rewrite_uses_shared_subnet_source_when_location_is_on_another_nic()
+    {
+        Assert.True(SsdpSubnetHelper.TryParseCidr("10.11.12.0/24", out var shared));
+        Assert.True(SsdpSubnetHelper.TryParseCidr("192.168.0.0/24", out var lan));
+
+        var rewritten = SsdpLocationHelper.RewriteHostFromResponseSource(
+            "http://10.1.99.19:5000/api/discovery/device.xml",
+            IPAddress.Parse("10.11.12.17"),
+            [shared, lan],
+            rewriteEnabled: true);
+
+        Assert.Equal("http://10.11.12.17:5000/api/discovery/device.xml", rewritten);
+    }
+
+    [Fact]
+    public void Rewrite_keeps_location_already_on_the_reply_subnet()
+    {
+        Assert.True(SsdpSubnetHelper.TryParseCidr("192.168.0.0/24", out var lan));
+        const string location = "http://192.168.0.21:5000/device.xml";
+
+        var rewritten = SsdpLocationHelper.RewriteHostFromResponseSource(
+            location,
+            IPAddress.Parse("192.168.0.20"),
+            [lan],
+            rewriteEnabled: true);
+
+        Assert.Equal(location, rewritten);
     }
 
     [Fact]
@@ -104,6 +169,12 @@ public class SsdpParsingTests
 
         Assert.Equal(IPAddress.Parse("10.8.0.2"), hosts[0]);
         Assert.Equal(IPAddress.Parse("10.8.0.3"), hosts[1]);
+    }
+
+    private static SsdpLocalIpv4Binding Binding(string address, string cidr)
+    {
+        Assert.True(SsdpSubnetHelper.TryParseCidr(cidr, out var subnet));
+        return new SsdpLocalIpv4Binding(IPAddress.Parse(address), subnet);
     }
 
     private static byte[] Packet(params string[] lines) =>
