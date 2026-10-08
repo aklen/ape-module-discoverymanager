@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using Ape.Core.Logging;
@@ -11,6 +12,7 @@ namespace Ape.Module.DiscoveryManager.Transport.Ssdp;
 /// SSDP discovery: one UDP socket on port 1900 with <see cref="MulticastOption"/> membership on each eligible
 /// IPv4 interface, periodic M-SEARCH on all interfaces, and
 /// passive NOTIFY / search-response handling. Optional inbound M-SEARCH handling uses the same socket.
+/// Membership follows interface changes: <see cref="NetworkChange.NetworkAddressChanged"/> plus the periodic search.
 /// </summary>
 public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
 {
@@ -26,8 +28,14 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
     private readonly SsdpDiscoveryOptions _options;
     private readonly byte[] _msearchPayload = SsdpDatagramParser.BuildMSearchRootDevice();
 
+    private static readonly TimeSpan InterfaceRefreshDelay = TimeSpan.FromMilliseconds(500);
+
+    private readonly object _membershipLock = new();
     private Socket? _socket;
     private IReadOnlyList<IPAddress> _joinedInterfaces = Array.Empty<IPAddress>();
+    private bool _defaultMembership;
+    private bool _watchingInterfaces;
+    private int _interfaceRefreshGeneration;
     private IReadOnlyList<SsdpIpv4Subnet> _vpnRewriteSubnets = Array.Empty<SsdpIpv4Subnet>();
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
@@ -76,62 +84,19 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
             socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             socket.Bind(new IPEndPoint(IPAddress.Any, MulticastPort));
 
-            var eligible = SsdpInterfaceHelper.GetEligibleLocalIpv4UnicastAddresses();
-            var joined = new List<IPAddress>();
-            var group = IPAddress.Parse(MulticastAddress);
-
-            if (eligible.Count > 0)
-            {
-                foreach (var local in eligible)
-                {
-                    try
-                    {
-                        socket.SetSocketOption(
-                            SocketOptionLevel.IP,
-                            SocketOptionName.AddMembership,
-                            new MulticastOption(group, local));
-                        joined.Add(local);
-                        _logger.LogInfo($"SSDP Discovery: multicast joined on {local}");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning($"SSDP Discovery: joinMulticastGroup failed on {local}: {ex.Message}");
-                    }
-                }
-            }
-
-            if (joined.Count == 0)
-            {
-                try
-                {
-                    socket.SetSocketOption(
-                        SocketOptionLevel.IP,
-                        SocketOptionName.AddMembership,
-                        new MulticastOption(group));
-                    _logger.LogInfo("SSDP Discovery: multicast joined on default interface (no eligible IPv4 NIC)");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning($"SSDP Discovery: default joinMulticastGroup failed: {ex.Message}");
-                }
-            }
-
-            _joinedInterfaces = joined;
             _socket = socket;
             RefreshVpnRewriteSubnets();
-
-            _logger.LogInfo(
-                $"SSDP Discovery: UDP {MulticastPort} multicast {MulticastAddress} — {joined.Count} interface(s) for M-SEARCH egress");
+            WatchInterfaces();
 
             _receiveTask = Task.Run(() => ReceiveLoopAsync(socket, token), token);
-            _msearchTask = Task.Run(() => PeriodicMsearchAsync(socket, joined, token), token);
+            _msearchTask = Task.Run(() => PeriodicMsearchAsync(token), token);
 
-            SendMsearchAllInterfaces(socket, joined);
-            SendVpnUnicastMsearch(socket);
+            RefreshMembership(onlySearchNew: false);
         }
         catch (Exception ex)
         {
             _logger.LogError($"SSDP Discovery: failed to start: {ex.Message}");
+            UnwatchInterfaces();
             try
             {
                 _socket?.Close();
@@ -150,6 +115,7 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
     public void Stop()
     {
         _logger.LogInfo("SSDP Discovery: Stopping device locator…");
+        UnwatchInterfaces();
         try
         {
             _cts?.Cancel();
@@ -159,9 +125,16 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
             // ignore
         }
 
+        Socket? socket;
+        lock (_membershipLock)
+        {
+            socket = _socket;
+            _socket = null;
+        }
+
         try
         {
-            _socket?.Close();
+            socket?.Close();
         }
         catch
         {
@@ -188,7 +161,6 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
 
         _receiveTask = null;
         _msearchTask = null;
-        _socket = null;
         _cts?.Dispose();
         _cts = null;
         _logger.LogInfo("SSDP Discovery: Device locator stopped.");
@@ -198,10 +170,7 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
     {
         _logger.LogInfo("SSDP Discovery: Active search (M-SEARCH)…");
         if (_socket != null && _socket.IsBound)
-        {
-            SendMsearchAllInterfaces(_socket, _joinedInterfaces);
-            SendVpnUnicastMsearch(_socket);
-        }
+            RefreshMembership(onlySearchNew: false);
         else
             _logger.LogWarning("SSDP Discovery: socket not bound; active search skipped");
 
@@ -259,20 +228,169 @@ public sealed class SsdpDiscoveryTransport : IDiscoveryTransport
         }
     }
 
-    private async Task PeriodicMsearchAsync(Socket socket, IReadOnlyList<IPAddress> joined, CancellationToken cancellationToken)
+    private async Task PeriodicMsearchAsync(CancellationToken cancellationToken)
     {
         try
         {
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(8));
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
-            {
-                SendMsearchAllInterfaces(socket, joined);
-                SendVpnUnicastMsearch(socket);
-            }
+                RefreshMembership(onlySearchNew: false);
         }
         catch (OperationCanceledException)
         {
             // normal shutdown
+        }
+    }
+
+    private void WatchInterfaces()
+    {
+        if (_watchingInterfaces)
+            return;
+
+        NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+        _watchingInterfaces = true;
+    }
+
+    private void UnwatchInterfaces()
+    {
+        if (!_watchingInterfaces)
+            return;
+
+        NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
+        _watchingInterfaces = false;
+        Interlocked.Increment(ref _interfaceRefreshGeneration);
+    }
+
+    private void OnNetworkAddressChanged(object? sender, EventArgs e)
+    {
+        var generation = Interlocked.Increment(ref _interfaceRefreshGeneration);
+        var token = _cts?.Token ?? CancellationToken.None;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(InterfaceRefreshDelay, token).ConfigureAwait(false);
+                if (generation != Volatile.Read(ref _interfaceRefreshGeneration) || !_watchingInterfaces)
+                    return;
+
+                RefreshMembership(onlySearchNew: true);
+            }
+            catch (OperationCanceledException)
+            {
+                // shutdown or a newer address-change burst
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"SSDP Discovery: interface refresh failed: {ex.Message}");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Re-reads eligible IPv4 interfaces, joins new ones, drops ones that went away,
+    /// then sends M-SEARCH. Address-change bursts search only the newly joined interfaces.
+    /// </summary>
+    private void RefreshMembership(bool onlySearchNew)
+    {
+        var socket = _socket;
+        if (socket == null || !socket.IsBound)
+            return;
+
+        List<IPAddress> added;
+        IReadOnlyList<IPAddress> targets;
+        lock (_membershipLock)
+        {
+            if (_socket == null)
+                return;
+
+            added = ApplyMembership(socket);
+            targets = onlySearchNew ? added : _joinedInterfaces.ToArray();
+            if (!onlySearchNew || added.Count > 0)
+                SendMsearchAllInterfaces(socket, targets);
+        }
+
+        if (!onlySearchNew || added.Count > 0)
+            SendVpnUnicastMsearch(socket);
+
+        if (added.Count > 0)
+            _logger.LogInfo($"SSDP Discovery: M-SEARCH on new interface(s): {string.Join(", ", added)}");
+    }
+
+    private List<IPAddress> ApplyMembership(Socket socket)
+    {
+        var eligible = SsdpInterfaceHelper.GetEligibleLocalIpv4UnicastAddresses();
+        var plan = SsdpInterfaceDiff.Plan(_joinedInterfaces, _defaultMembership, eligible);
+        if (!plan.HasChanges)
+            return [];
+
+        var group = IPAddress.Parse(MulticastAddress);
+        foreach (var address in plan.Leave)
+            TryDrop(socket, new MulticastOption(group, address), address);
+
+        if (plan.LeaveDefault && TryDrop(socket, new MulticastOption(group), address: null))
+            _defaultMembership = false;
+
+        var added = new List<IPAddress>();
+        foreach (var address in plan.Join)
+        {
+            if (TryJoin(socket, new MulticastOption(group, address), address))
+                added.Add(address);
+        }
+
+        if (plan.JoinDefault)
+            _defaultMembership = TryJoin(socket, new MulticastOption(group), address: null);
+
+        var left = new HashSet<IPAddress>(plan.Leave);
+        var joined = new List<IPAddress>(_joinedInterfaces.Count);
+        foreach (var address in _joinedInterfaces)
+        {
+            if (!left.Contains(address))
+                joined.Add(address);
+        }
+
+        joined.AddRange(added);
+        _joinedInterfaces = joined;
+        var membership = joined.Count > 0 ? string.Join(", ", joined) : "none";
+        if (_defaultMembership)
+            membership = joined.Count > 0 ? membership + " + default" : "default";
+        _logger.LogInfo(
+            $"SSDP Discovery: UDP {MulticastPort} multicast {MulticastAddress} — membership now {membership}");
+        return added;
+    }
+
+    private bool TryJoin(Socket socket, MulticastOption membership, IPAddress? address)
+    {
+        try
+        {
+            socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, membership);
+            _logger.LogInfo(address == null
+                ? "SSDP Discovery: multicast joined on default interface (no eligible IPv4 NIC)"
+                : $"SSDP Discovery: multicast joined on {address}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            var where = address?.ToString() ?? "default interface";
+            _logger.LogWarning($"SSDP Discovery: joinMulticastGroup failed on {where}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private bool TryDrop(Socket socket, MulticastOption membership, IPAddress? address)
+    {
+        try
+        {
+            socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, membership);
+            _logger.LogInfo(address == null
+                ? "SSDP Discovery: left default multicast membership"
+                : $"SSDP Discovery: multicast left {address}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            var where = address?.ToString() ?? "default interface";
+            _logger.LogDebug($"SSDP Discovery: drop membership failed on {where}: {ex.Message}");
+            return false;
         }
     }
 

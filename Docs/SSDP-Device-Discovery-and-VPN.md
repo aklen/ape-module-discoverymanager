@@ -74,6 +74,8 @@ On start, the transport:
 2. For each eligible local address, calls `AddMembership` for group **`239.255.255.250`** scoped to that interface.
 3. If no interface qualifies, falls back to a default `MulticastOption` without a specific local address.
 
+The same diff runs again when `NetworkChange.NetworkAddressChanged` fires (debounced) and on every periodic M-SEARCH. A newly eligible address is joined and searched immediately. An address that is no longer up is dropped. The event is the BCL signal on Windows, Linux, and macOS; it reports that some address changed, so the transport re-reads `GetAllNetworkInterfaces()` and compares that set with the memberships it already holds. The 8-second loop is the backstop when the event does not fire (for example a macOS tunnel that never publishes an IPv4 service).
+
 ### 4.3 M-SEARCH egress per interface
 
 `SendMsearchAllInterfaces` sets `MulticastInterface` to each joined local address, then sends the same M-SEARCH payload to `239.255.255.250:1900`:
@@ -91,8 +93,9 @@ This ensures M-SEARCH leaves on **Wi‑Fi, Ethernet, VPN NIC**, etc., not only t
 ### 4.4 Timing
 
 - **On start**: one multicast M-SEARCH round + VPN unicast probe (if enabled).
-- **Every 8 seconds**: same via `PeriodicMsearchAsync`.
-- **Active search** (`DiscoverDevicesAsync`): sends both, waits **3.5 s**, returns collected `LOCATION` values.
+- **On interface change**: join or drop, then M-SEARCH on each newly joined address.
+- **Every 8 seconds**: re-read interfaces, then M-SEARCH on the current set, via `PeriodicMsearchAsync`.
+- **Active search** (`DiscoverDevicesAsync`): re-reads interfaces, sends both, waits **3.5 s**, returns collected `LOCATION` values.
 
 Passive discovery also handles **`NOTIFY ssdp:alive`** and **`ssdp:byebye`** on the receive loop.
 
@@ -267,6 +270,7 @@ Multicast path on LAN is unchanged: M-SEARCH to `239.255.255.250`, NOTIFY, and p
 | `Services/DiscoveryManagerService.cs` | Wires transports, M-SEARCH responder, initial active search |
 | `Transport/Ssdp/SsdpDiscoveryTransport.cs` | Socket, multicast, VPN unicast M-SEARCH, receive loop |
 | `Transport/Ssdp/SsdpInterfaceHelper.cs` | Eligible LAN + VPN interface detection |
+| `Transport/Ssdp/SsdpInterfaceDiff.cs` | Join/leave plan when the eligible set changes |
 | `Transport/Ssdp/SsdpSubnetHelper.cs` | CIDR parse, host enumeration |
 | `Transport/Ssdp/SsdpLocationHelper.cs` | LOCATION host rewrite |
 | `Transport/Ssdp/SsdpDiscoveryOptions.cs` | Config parsing |
