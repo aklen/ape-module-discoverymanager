@@ -16,8 +16,10 @@ public class SsdpAdvertisementTransport : IDiscoveryTransport
 
     public string TransportType => "ssdp";
 
+#pragma warning disable CS0067 // This transport only publishes. Discovery and loss are raised by the search transport.
     public event Action<IEnumerable<string>>? DevicesDiscovered;
     public event Action<string>? DeviceLost;
+#pragma warning restore CS0067
 
     public SsdpAdvertisementTransport(ILogger logger)
     {
