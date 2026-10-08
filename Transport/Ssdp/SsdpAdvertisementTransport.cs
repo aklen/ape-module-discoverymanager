@@ -1,3 +1,4 @@
+using System.Net.Sockets;
 using Ape.Core.Logging;
 using Ape.Core.Network.Discovery;
 using Rssdp;
@@ -37,9 +38,7 @@ public class SsdpAdvertisementTransport : IDiscoveryTransport
     {
         _logger.LogInfo($"SSDP Advertisement: Stopping advertisement transport...");
         if (_rootDevice != null && _publisher != null)
-        {
-            _publisher.RemoveDevice(_rootDevice);
-        }
+            TryRemoveDevice(_rootDevice);
         _publisher?.Dispose();
         _publisher = null;
     }
@@ -61,9 +60,7 @@ public class SsdpAdvertisementTransport : IDiscoveryTransport
         }
 
         if (_rootDevice != null)
-        {
-            _publisher.RemoveDevice(_rootDevice);
-        }
+            TryRemoveDevice(_rootDevice);
 
         var deviceUuid = Guid.NewGuid().ToString();
 
@@ -79,7 +76,19 @@ public class SsdpAdvertisementTransport : IDiscoveryTransport
             Uuid = deviceUuid
         };
 
-        _publisher.AddDevice(_rootDevice);
+        try
+        {
+            _publisher.AddDevice(_rootDevice);
+        }
+        catch (SocketException ex)
+        {
+            _logger.LogWarning(
+                $"SSDP Advertisement: alive notification failed ({ex.SocketErrorCode}), advertisement skipped: {ex.Message}");
+            TryRemoveDevice(_rootDevice);
+            _rootDevice = null;
+            return;
+        }
+
         _logger.LogInfo($"SSDP Advertisement: Device advertised with UUID: {deviceUuid}, Location: {locationUrl}");
     }
 
@@ -94,5 +103,23 @@ public class SsdpAdvertisementTransport : IDiscoveryTransport
     public void Dispose()
     {
         Stop();
+    }
+
+    /// <summary>
+    /// Bye-bye uses the same UDP send as alive. An unreachable multicast route must not tear down the process.
+    /// </summary>
+    private void TryRemoveDevice(SsdpRootDevice device)
+    {
+        if (_publisher == null)
+            return;
+
+        try
+        {
+            _publisher.RemoveDevice(device);
+        }
+        catch (Exception ex) when (ex is SocketException or ArgumentException or InvalidOperationException)
+        {
+            _logger.LogWarning($"SSDP Advertisement: bye-bye failed: {ex.Message}");
+        }
     }
 }
